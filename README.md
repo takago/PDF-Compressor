@@ -63,6 +63,7 @@ python3 -m venv .venv
 ### サービスの登録・有効化
 
 ```bash
+sudo loginctl enable-linger "$USER"
 mkdir -p ~/.config/systemd/user
 cp systemd/pdf-compressor.service ~/.config/systemd/user/
 systemctl --user daemon-reload
