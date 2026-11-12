@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PDF Compressor</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif;color:#243046;background:#f6f8fc}
+    *{box-sizing:border-box} body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}
+    main{background:white;border-radius:20px;box-shadow:0 9px 35px #20325713;padding:36px;width:min(100%,620px)}
+    h1{font-size:1.65rem;margin:0 0 8px;letter-spacing:-.025em} .muted{color:#66758a;font-size:.92rem}
+    #drop{border:2px dashed #a4b5cf;border-radius:15px;background:#f8fbff;text-align:center;padding:60px 20px;margin:26px 0 16px;transition:.15s;cursor:pointer}
+    #drop.over{border-color:#2774dd;background:#eaf3ff;transform:scale(1.01)}
+    #drop strong{display:block;font-size:1.16rem;margin:8px 0} .symbol{font-size:2.4rem;color:#4c80c1}
+    .hide{display:none!important} #result{border-radius:14px;background:#f5f9ff;padding:22px;margin-top:20px}
+    .numbers{display:flex;justify-content:space-between;gap:15px;margin:18px 0}
+    .numbers>div{flex:1}.numbers small{display:block;color:#66758a}.numbers b{font-size:1.65rem}
+    .good{color:#157347}.warn{color:#a66513}.bar{height:10px;background:#d9e4f1;border-radius:12px;overflow:hidden;margin-bottom:12px}
+    #barFill{height:100%;background:#339e79;width:0;transition:width .3s}
+    a{color:#1766b1;overflow-wrap:anywhere} #error{color:#ae2333;background:#fff1f1;padding:14px;border-radius:10px;margin-top:16px}
+    footer{margin-top:20px;font-size:.8rem;color:#69778c} footer .credit{margin-top:10px;text-align:center} footer .credit a{color:inherit;text-decoration:underline;text-underline-offset:2px} footer .credit a:hover{color:#1766b1} #status{margin-top:15px;color:#52637a} .spinner{display:inline-block;width:14px;height:14px;border:2px solid #dae2ec;border-top-color:#367bd3;border-radius:50%;animation:spin 0.8s linear infinite;vertical-align:-2px;margin-right:8px}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @media(max-width:500px){main{padding:22px}#drop{padding:36px 14px}.numbers b{font-size:1.35rem}}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>PDF Compressor</h1>
+    <div class="muted">画像だけを圧縮して，1 MB以内を目指します．文字とフォーム入力は維持します．</div>
+    <div id="drop" tabindex="0" role="button" aria-label="PDFをドロップまたは選択">
+      <div class="symbol">⇩</div>
+      <strong>ここにPDFをドロップ</strong>
+      <span class="muted">複数PDFもまとめて処理できます．クリックして選択することもできます．</span>
+    </div>
+    <input id="file" type="file" accept="application/pdf,.pdf" multiple hidden>
+    <div id="status" class="hide" role="status" aria-live="polite"><span class="spinner"></span>アップロードしています…</div>
+    <div id="error" class="hide" role="alert"></div>
+    <div id="batchProgress" class="hide muted" role="status"></div>
+    <section id="result" class="hide" aria-live="polite">
+      <strong id="headline">圧縮が完了しました．</strong>
+      <div class="numbers">
+        <div><small>元のサイズ</small><b id="before"></b></div>
+        <div><small>処理後</small><b id="after"></b></div>
+      </div>
+      <div class="bar"><div id="barFill"></div></div>
+      <div id="reduction"></div>
+      <p id="note" class="muted hide"></p>
+      <p><span id="fileLabel">PDF</span>：<a id="download" href="#" download="">圧縮済みPDF</a></p>
+      <div id="batchFiles" class="muted hide" style="overflow-wrap:anywhere"></div>
+      <div class="muted">処理結果は自動ダウンロードされます．必要なら上のリンクから再取得できます．</div>
+      <div class="muted" style="margin-top:7px">保存したファイルは処理完了から5分後にサーバで削除されます．</div>
+    </section>
+    <footer>通信は暗号化されません．電話番号やパスワードなど機密性の高い情報を含むPDFの利用は避けてください．ファイルは処理完了後，最大5分程度で削除されます．<div class="credit">© TAKAGO_LAB 2026 · <a href="https://github.com/takago/PDF-Compressor" target="_blank" rel="noopener noreferrer" aria-label="PDF Compressor on GitHub">GitHub</a></div></footer>
+  </main>
+<script>
+(()=>{
+  'use strict';
+  const $=id=>document.getElementById(id);
+  const drop=$('drop'),picker=$('file'),status=$('status'),result=$('result'),err=$('error');
+  const debug = new URLSearchParams(location.search).get('debug') === '1';
+  let busy=false;
+  const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  const mb=n=>(n/1000000).toFixed(2)+' MB';
+  const setStatus=text=>{status.textContent=text;status.classList.remove('hide')};
+  const showError=text=>{err.textContent=text;err.classList.remove('hide')};
+  function startDownload(url){
+    const iframe=document.createElement('iframe');
+    iframe.hidden=true; iframe.src=url; document.body.appendChild(iframe);
+    setTimeout(()=>iframe.remove(),30000);
+  }
+  async function request(url, options){
+    const response=await fetch(url,options);
+    let data;
+    try{data=await response.json()}catch{throw new Error('サーバから正常な応答を取得できませんでした．')}
+    if(!response.ok)throw new Error(data.error||'サーバでエラーが発生しました．');
+    return data;
+  }
+  async function waitFor(statusUrl, callback){
+    while(true){
+      await sleep(1500);
+      const data=await request(statusUrl,{cache:'no-store'});
+      if(data.status==='failed')throw new Error(data.error||'圧縮に失敗しました．');
+      if(data.status==='done')return data;
+      callback(data);
+    }
+  }
+  function showTotals(before,after,headline){
+    $('before').textContent=mb(before);
+    $('after').textContent=mb(after);
+    const percent=before?Math.max(0,(1-after/before)*100):0;
+    $('barFill').style.width=(before?Math.min(100,after/before*100):0)+'%';
+    $('reduction').textContent='削減率 '+percent.toFixed(1)+'%';
+    $('headline').textContent=headline;
+    $('headline').className=after<before?'good':'warn';
+  }
+  async function upload(input){
+    if(busy)return;
+    const files=Array.from(input||[]);
+    if(!files.length)return;
+    if(files.some(f=>!/\.pdf$/i.test(f.name))){showError('PDFファイルだけを選択してください．');return}
+    if(files.some(f=>f.size>100000000)){showError('1ファイルあたり100 MBまでです．');return}
+    if(files.length>100){showError('一度にアップロードできるPDFは100件までです．');return}
+    if(files.length>1 && files.reduce((sum,f)=>sum+f.size,0)>500000000){showError('一度のアップロード合計は500 MBまでです．');return}
+    busy=true;err.classList.add('hide');result.classList.add('hide');$('batchProgress').classList.add('hide');
+    drop.setAttribute('aria-disabled','true');setStatus(files.length+'件のPDFをアップロードしています…');
+    try{
+      const body=new FormData();
+      for(const f of files)body.append(files.length===1?'file':'files',f,f.name);
+      const isBatch=files.length>1;
+      const accepted=await request(isBatch?'/api/batches':'/api/compress',{method:'POST',body});
+      const data=await waitFor(accepted.status_url,update=>{
+        if(isBatch){
+          setStatus('圧縮中：完了 '+update.completed+'/'+update.total+'件，処理中 '+update.running+'件，待機 '+update.queued+'件');
+          $('batchProgress').textContent=update.files.filter(f=>f.status==='failed').length+'件でエラーが発生しました．';
+          $('batchProgress').classList.toggle('hide',!update.failed);
+        }else if(update.status==='queued'){
+          setStatus('順番待ち：あなたの前に'+update.ahead+'件．画面を開いたままにしてください．');
+        }else setStatus('PDFを圧縮しています…');
+      });
+      if(isBatch){
+        const successes=data.files.filter(f=>f.status==='done');
+        const failed=data.files.filter(f=>f.status==='failed');
+        const before=successes.reduce((a,f)=>a+f.input_bytes,0);
+        const after=successes.reduce((a,f)=>a+f.output_bytes,0);
+        showTotals(before,after,successes.length+'件のPDFを処理しました．'+(failed.length?'（'+failed.length+'件失敗）':''));
+        $('batchFiles').replaceChildren();
+        for(const f of data.files){
+          const line=document.createElement('div');
+          line.textContent=f.status==='done'?f.filename+'：'+mb(f.input_bytes)+' → '+mb(f.output_bytes):f.name+'：失敗（'+f.error+'）';
+          $('batchFiles').appendChild(line);
+        }
+        $('batchFiles').classList.remove('hide');
+        $('note').textContent='成功：'+successes.length+'件，失敗：'+failed.length+'件．ZIPには成功したPDFのみ含まれます．';
+        $('note').classList.toggle('hide',failed.length===0&&!debug);
+        if(data.download_url){
+          $('fileLabel').textContent='ZIP';$('download').textContent='compressed_pdfs.zip';
+          $('download').href=data.download_url;$('download').download='compressed_pdfs.zip';
+          result.classList.remove('hide');startDownload(data.download_url);
+        }else throw new Error('すべてのPDFの処理に失敗しました．'+failed.map(f=>f.error).join('，'));
+      }else{
+        showTotals(data.input_bytes,data.output_bytes,data.compressed_images>0?'画像圧縮が完了しました．':(data.reason==='already_under_target'?'すでに1 MB以内です．':'画像は圧縮されませんでした．'));
+        $('fileLabel').textContent='PDF';
+        $('batchFiles').classList.add('hide');
+        $('note').textContent=data.note + '（表示画像：'+(data.displayed_images ?? data.image_count)+'件，通常画像：'+(data.eligible_images ?? '?')+'件，参照未解決（インライン候補）：'+(data.unresolved_image_refs ?? data.inline_images ?? 0)+'件，画像リソース：'+(data.resource_images ?? '?')+'件，文書全体の画像XObject：'+(data.document_image_xobjects ?? 0)+'件，ページ外から補足：'+(data.document_fallback_images ?? 0)+'件，リソースから補足：'+(data.resource_fallback_images ?? 0)+'件，うちインライン圧縮：'+(data.compressed_inline_images ?? 0)+'件，圧縮済み合計：'+data.compressed_images+'件）' + (data.inline_blocks_found!==undefined?' 描画命令内：'+data.inline_blocks_found+'件，辞書解析可能：'+data.inline_blocks_parseable+'件，フォーム内部：'+data.inline_in_forms+'件，未対応：'+data.inline_unsupported+'件，位置未特定：'+data.inline_unknown_location+'件．':'');
+        if(data.scan_category && data.compressed_images===0){
+          $('note').textContent+=' 追加診断：'+data.scan_category+'．画像XObject：'+data.scan_image_xobjects+'件，その他のストリーム候補：'+data.scan_other_stream_hits+'件，探索省略：'+data.scan_streams_skipped+'件．';
+        }
+        $('note').classList.toggle('hide',!debug);
+        $('download').href=data.download_url;
+        $('download').textContent=data.filename;
+        $('download').download=data.filename;
+        result.classList.remove('hide');startDownload(data.download_url);
+      }
+    }catch(e){showError(e.message||'通信エラーが発生しました．')}
+    finally{busy=false;status.classList.add('hide');drop.removeAttribute('aria-disabled');picker.value=''}
+  }
+  for(const ev of ['dragenter','dragover'])drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')});
+  for(const ev of ['dragleave','drop'])drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over')});
+  drop.addEventListener('drop',e=>upload(e.dataTransfer.files));
+  document.addEventListener('dragover',e=>e.preventDefault());
+  document.addEventListener('drop',e=>{e.preventDefault();if(!drop.contains(e.target))upload(e.dataTransfer.files)});
+  drop.addEventListener('click',()=>{if(!busy)picker.click()});
+  drop.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();if(!busy)picker.click()}});
+  picker.addEventListener('change',()=>upload(picker.files));
+})();
+</script>
+</body></html>
