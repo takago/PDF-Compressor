@@ -1,0 +1,17 @@
+[Unit]
+Description=PDF Compressor web service
+Documentation=https://github.com/takago/PDF-Compressor
+
+[Service]
+Type=simple
+# This unit assumes the repository is checked out at ~/PDF-Compressor.
+# If located elsewhere, adjust WorkingDirectory and ExecStart.
+WorkingDirectory=%h/PDF-Compressor
+ExecStart=%h/PDF-Compressor/.venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+
+[Install]
+WantedBy=default.target

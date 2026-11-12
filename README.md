@@ -44,6 +44,53 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
 
 サーバ自身からは `http://localhost:8000/`，別のPCからは `http://<サーバのIPアドレス>:8000/` にアクセスします．終了するにはターミナルで `Ctrl+C` を入力します．HTTP運用では通信が暗号化されないため，利用するネットワークとアクセス範囲を適切に制限してください．
 
+## systemdユーザーサービスとして実行する（Linux）
+
+ログインユーザーの権限でPDF Compressorを起動するためのユニットファイルを，`systemd/pdf-compressor.service` に同梱しています．root権限でのシステムサービス登録は必要ありません．
+
+**標準のユニットファイルは，リポジトリを `~/PDF-Compressor` に配置した場合に動作します．** まだクローンしていない場合は，次のようにホームディレクトリで取得し，上記の「セットアップ」に従って `.venv` を作成してください．
+
+```bash
+cd ~
+git clone https://github.com/takago/PDF-Compressor.git
+cd ~/PDF-Compressor
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+すでに別の場所へクローンしている場合は，`systemd/pdf-compressor.service` の `WorkingDirectory` と `ExecStart` を実際の絶対パスに変更してから登録してください．`ExecStart` は仮想環境のPythonを使います．
+
+### サービスの登録・有効化
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/pdf-compressor.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pdf-compressor.service
+systemctl --user status pdf-compressor.service
+```
+
+`enable --now` は，現在のユーザーセッションで起動すると同時に，今後のユーザーsystemd起動時にもサービスを自動起動する設定です．起動後は `http://localhost:8000/` にアクセスできます．
+
+### ログ確認・再起動・停止
+
+```bash
+journalctl --user -u pdf-compressor.service -f
+systemctl --user restart pdf-compressor.service
+systemctl --user stop pdf-compressor.service
+systemctl --user disable --now pdf-compressor.service
+```
+
+`stop` は今回の実行を停止し，`disable --now` は自動起動も無効化します．ユニットファイルを編集した後は `systemctl --user daemon-reload` を実行してから再起動してください．
+
+**ログアウト後やOS起動直後にも，ログインせずサービスを稼働させる場合**は，管理者権限でlingerを有効化する必要がある場合があります．例えば次のコマンドです（システムの運用規程に従ってください）．
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+このサービスは `0.0.0.0:8000` でHTTPを待ち受けます．アクセス可能なネットワークを必ず制限してください．`--workers 1` はUvicornのプロセス数であり，PDF圧縮はアプリ内部で最大2並列です．**手動起動したUvicornと同時に動かさないでください**（ポート競合・キューの分離を防ぐため）．また，ユーザーサービスはログインセッションやlingerの設定により稼働期間が変わります．
+
 ## 使い方
 
 ### PDFを1件圧縮する
