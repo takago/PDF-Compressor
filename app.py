@@ -27,7 +27,7 @@ MAX_UPLOAD = int(os.environ.get('PDF_OPT_MAX_MB', '100')) * 1_000_000
 TTL = 300
 PROCESS_TIMEOUT = 120
 MAX_RUNNING = 2
-MAX_WAITING = 300
+MAX_WAITING = 600
 # A waiting upload must not accumulate on disk indefinitely if the queue stalls.
 MAX_WAIT_SECONDS = 3600
 logger = logging.getLogger('pdf_compressor')
@@ -255,8 +255,8 @@ async def compress(file: UploadFile = File(...)):
 
 
 # Upload a batch as one request, registering all jobs together.
-# Limit an individual drop so an accidental selection cannot consume the entire queue.
-MAX_BATCH_FILES = 100
+# Cap a single batch at 300 files while preserving room for other users in the 600-job queue.
+MAX_BATCH_FILES = 300
 MAX_BATCH_BYTES = 500_000_000
 admission_lock: asyncio.Lock | None = None
 

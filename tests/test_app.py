@@ -537,3 +537,16 @@ def test_jpeg_replacement_preserves_decoder_and_page_render(tmp_path):
         region = (40, 70, 555, 520)
         discrepancy = ImageChops.difference(source_render.crop(region), compressed_render.crop(region))
         assert max(ImageStat.Stat(discrepancy).mean) < 35
+
+
+def test_batch_and_queue_limits_for_large_class(tmp_path, monkeypatch):
+    """A 300-file batch is allowed by the configured limits; 301 is rejected."""
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    assert app.MAX_BATCH_FILES == 300
+    assert app.MAX_WAITING == 600
+    assert app.MAX_RUNNING == 2
+    with TestClient(app.app) as client:
+        many = [('files', (f'doc{i}.pdf', b'%PDF-', 'application/pdf')) for i in range(301)]
+        response = client.post('/api/batches', files=many)
+        assert response.status_code == 400
+        assert '300' in str(response.json())

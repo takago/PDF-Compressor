@@ -99,7 +99,7 @@
     if(!files.length)return;
     if(files.some(f=>!/\.pdf$/i.test(f.name))){showError('PDFファイルだけを選択してください．');return}
     if(files.some(f=>f.size>100000000)){showError('1ファイルあたり100 MBまでです．');return}
-    if(files.length>100){showError('一度にアップロードできるPDFは100件までです．');return}
+    if(files.length>300){showError('一度にアップロードできるPDFは300件までです．');return}
     if(files.length>1 && files.reduce((sum,f)=>sum+f.size,0)>500000000){showError('一度のアップロード合計は500 MBまでです．');return}
     busy=true;err.classList.add('hide');result.classList.add('hide');$('batchProgress').classList.add('hide');
     drop.setAttribute('aria-disabled','true');setStatus(files.length+'件のPDFをアップロードしています…');
