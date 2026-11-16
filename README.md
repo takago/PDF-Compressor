@@ -1,8 +1,14 @@
 # PDF Compressor
 
-PDFファイル（大学のレポート課題など数ページのPDF文書）をドラッグ＆ドロップするだけで，埋め込み画像を再圧縮し，ファイルサイズを小さくするWebアプリケーションです．**1 MB以内を目標**に画像の解像度とJPEG品質を段階的に調整します．画像以外のテキスト，リンク，フォームの値は可能な限り維持し，処理後に検証します．1 MBへの縮小や全PDFでの表示の完全一致を保証するものではありません．
+PDFファイルをドラッグ＆ドロップするだけで，埋め込み画像を再圧縮し，ファイルサイズを小さくするWebアプリケーションです．**1 MB以内を目標**に画像の解像度とJPEG品質を段階的に調整します．画像以外のテキスト，リンク，フォームの値は可能な限り維持し，処理後に検証します．1 MBへの縮小や全PDFでの表示の完全一致を保証するものではありません．
 
 **GitHub:** https://github.com/takago/PDF-Compressor
+
+## 画像の表示品質について
+
+JPEG画像を書き戻す際は，画像ストリームの更新後にPDFの `/Filter /DCTDecode` を設定します．`update_stream()` によって `/Filter` が除去されるため，設定順を逆にすると画像が砂嵐状に表示されることがあります．通常画像XObjectとインライン画像から生成したXObjectの両方に同じ処理を適用しています．
+
+圧縮後の画像が元の画像と異なって見える場合は，元PDFを残したうえで，`python -m pytest -q` を実行して環境を確認してください．既に壊れたPDFではなく，必ず元PDFから再圧縮してください．
 
 ## 主な機能
 
@@ -39,10 +45,10 @@ python -m pip install -r requirements.txt
 Webサーバを起動します．**Uvicornのワーカーは必ず1つ**にしてください．これは圧縮処理の同時実行数とは別の設定です．
 
 ```bash
-uvicorn app:app --host 0.0.0.0 --port 9353 --workers 1
+uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-サーバ自身からは `http://localhost:9353/`，別のPCからは `http://<サーバのIPアドレス>:9353/` にアクセスします．終了するにはターミナルで `Ctrl+C` を入力します．HTTP運用では通信が暗号化されないため，利用するネットワークとアクセス範囲を適切に制限してください．
+サーバ自身からは `http://localhost:8000/`，別のPCからは `http://<サーバのIPアドレス>:8000/` にアクセスします．終了するにはターミナルで `Ctrl+C` を入力します．HTTP運用では通信が暗号化されないため，利用するネットワークとアクセス範囲を適切に制限してください．
 
 ## systemdユーザーサービスとして実行する（Linux）
 
@@ -63,7 +69,6 @@ python3 -m venv .venv
 ### サービスの登録・有効化
 
 ```bash
-sudo loginctl enable-linger "$USER"
 mkdir -p ~/.config/systemd/user
 cp systemd/pdf-compressor.service ~/.config/systemd/user/
 systemctl --user daemon-reload
@@ -71,7 +76,7 @@ systemctl --user enable --now pdf-compressor.service
 systemctl --user status pdf-compressor.service
 ```
 
-`enable --now` は，現在のユーザーセッションで起動すると同時に，今後のユーザーsystemd起動時にもサービスを自動起動する設定です．起動後は `http://localhost:9353/` にアクセスできます．
+`enable --now` は，現在のユーザーセッションで起動すると同時に，今後のユーザーsystemd起動時にもサービスを自動起動する設定です．起動後は `http://localhost:8000/` にアクセスできます．
 
 ### ログ確認・再起動・停止
 
@@ -90,7 +95,7 @@ systemctl --user disable --now pdf-compressor.service
 sudo loginctl enable-linger "$USER"
 ```
 
-このサービスは `0.0.0.0:9353` でHTTPを待ち受けます．アクセス可能なネットワークを必ず制限してください．`--workers 1` はUvicornのプロセス数であり，PDF圧縮はアプリ内部で最大2並列です．**手動起動したUvicornと同時に動かさないでください**（ポート競合・キューの分離を防ぐため）．また，ユーザーサービスはログインセッションやlingerの設定により稼働期間が変わります．
+このサービスは `0.0.0.0:8000` でHTTPを待ち受けます．アクセス可能なネットワークを必ず制限してください．`--workers 1` はUvicornのプロセス数であり，PDF圧縮はアプリ内部で最大2並列です．**手動起動したUvicornと同時に動かさないでください**（ポート競合・キューの分離を防ぐため）．また，ユーザーサービスはログインセッションやlingerの設定により稼働期間が変わります．
 
 ## 使い方
 
@@ -114,7 +119,7 @@ sudo loginctl enable-linger "$USER"
 通常の利用画面は最小限の情報だけを表示します．画像検出数，圧縮件数，未対応画像などの詳細を確認したいときは，URLに `?debug=1` を付けます．
 
 ```text
-http://localhost:9353/?debug=1
+http://localhost:8000/?debug=1
 ```
 
 これは**画面表示の切り替え**であり，認証・アクセス制限ではありません．PDFの本文や画像データを診断目的で外部送信する機能ではありません．
@@ -147,7 +152,7 @@ http://localhost:9353/?debug=1
 例：一時ファイルの保存先を変更して起動します．
 
 ```bash
-PDF_OPT_TMP=/var/tmp/pdf-compressor uvicorn app:app --host 0.0.0.0 --port 9353 --workers 1
+PDF_OPT_TMP=/var/tmp/pdf-compressor uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 `PDF_OPT_MAX_MB` を変更するときは，`static/index.html` 内のクライアント側の制限・表示も合わせて変更してください．その他のキュー・時間制限の値は `app.py` で定義されています．

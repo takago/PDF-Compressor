@@ -192,7 +192,10 @@ def test_compresses_raw_inline_preserving_text_and_form(tmp_path):
         assert field_snapshot(before) == field_snapshot(after)
         assert before[0].get_text('text') == after[0].get_text('text')
         assert len(after[0].get_image_info(xrefs=True)) == 1
-        assert after[0].get_image_info(xrefs=True)[0]['xref'] > 0
+        image_xref = after[0].get_image_info(xrefs=True)[0]['xref']
+        assert image_xref > 0
+        assert after.xref_get_key(image_xref, 'Filter')[1] == '/DCTDecode'
+        assert after.extract_image(image_xref)['ext'] == 'jpeg'
         assert after[0].get_pixmap().samples != b''
 
 
@@ -510,3 +513,27 @@ def test_batch_state_marks_expiry_even_without_browser_polling(tmp_path, monkeyp
             time.sleep(.05)
         assert app.batches[bid].state == 'ready'
         assert app.batches[bid].expires > time.time()
+
+
+def test_jpeg_replacement_preserves_decoder_and_page_render(tmp_path):
+    """The generated PDF must render, not merely preserve its text/form data."""
+    from PIL import ImageChops, ImageStat
+
+    original = tmp_path / 'source.pdf'
+    output = tmp_path / 'compressed.pdf'
+    sample_pdf(original)
+    stats = optimize(original, output)
+    assert stats['compressed_images'] >= 1
+    with fitz.open(original) as source, fitz.open(output) as compressed:
+        image_xrefs = [entry[0] for entry in compressed[0].get_images()]
+        assert image_xrefs
+        for xref in image_xrefs:
+            if compressed.xref_get_key(xref, 'Filter')[1] == '/DCTDecode':
+                assert compressed.extract_image(xref)['ext'] == 'jpeg'
+        source_render = Image.frombytes('RGB', [source[0].get_pixmap().width, source[0].get_pixmap().height], source[0].get_pixmap().samples)
+        compressed_render = Image.frombytes('RGB', [compressed[0].get_pixmap().width, compressed[0].get_pixmap().height], compressed[0].get_pixmap().samples)
+        # JPEG recompression + downsampling are lossy, but should keep the
+        # overall displayed image, rather than JPEG bytes interpreted as pixels.
+        region = (40, 70, 555, 520)
+        discrepancy = ImageChops.difference(source_render.crop(region), compressed_render.crop(region))
+        assert max(ImageStat.Stat(discrepancy).mean) < 35

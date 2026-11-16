@@ -169,6 +169,8 @@ def add_xobject(doc: fitz.Document, owner_xref: int, image: bytes, name: str) ->
         cs = '/DeviceGray' if im.mode == 'L' else '/DeviceRGB'
     doc.update_object(xref, f'<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace {cs} /BitsPerComponent 8 /Filter /DCTDecode >>')
     doc.update_stream(xref, image, compress=False)
+    # update_stream clears /Filter, so restore the JPEG decoder afterward.
+    doc.xref_set_key(xref, "Filter", "/DCTDecode")
     path = ('XObject/' if target == res_xref else '') + name
     doc.xref_set_key(target, path, f'{xref} 0 R')
 

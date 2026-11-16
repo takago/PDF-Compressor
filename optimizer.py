@@ -218,6 +218,9 @@ def _replace_image_object(doc: fitz.Document, xref: int, jpeg: bytes) -> None:
     doc.update_object(xref, f'<< /Type /XObject /Subtype /Image /Width {w} /Height {h} '
                             f'/ColorSpace {cs} /BitsPerComponent 8 /Filter /DCTDecode >>')
     doc.update_stream(xref, jpeg, compress=False)
+    # PyMuPDF update_stream removes the previous /Filter entry.
+    # Set it only AFTER writing the JPEG bytes.
+    doc.xref_set_key(xref, "Filter", "/DCTDecode")
 
 
 def as_jpeg(source: bytes, target: tuple[int, int], quality: int) -> bytes | None:
