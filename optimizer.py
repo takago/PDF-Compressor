@@ -22,6 +22,25 @@ class UnsafePDF(ValueError):
     pass
 
 
+class MissingXrefError(UnsafePDF):
+    """An unavailable xref prevented a complete signature safety check."""
+
+
+def _is_missing_xref(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return 'cannot find object in xref' in message or 'bad xref' in message
+
+
+def _image_info(page: fitz.Page) -> list[dict]:
+    """If only xref matching fails, retain image geometry without guessed refs."""
+    try:
+        return page.get_image_info(xrefs=True)
+    except (RuntimeError, ValueError) as exc:
+        if not _is_missing_xref(exc):
+            raise
+        return [dict(info, xref=0) for info in page.get_image_info(xrefs=False)]
+
+
 @dataclass(frozen=True)
 class ImageUse:
     page_number: int
@@ -62,9 +81,21 @@ def check_pdf(doc: fitz.Document) -> None:
             if widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE:
                 raise UnsafePDF('署名フィールドを含むPDFは変更しません．')
     # Signed documents can also include signatures in other form structures.
+    missing = 0
     for xref in range(1, doc.xref_length()):
-        if '/ByteRange' in doc.xref_object(xref):
+        try:
+            object_def = doc.xref_object(xref)
+        except (RuntimeError, ValueError) as exc:
+            if not _is_missing_xref(exc):
+                raise
+            missing += 1
+            continue
+        if '/ByteRange' in object_def:
             raise UnsafePDF('電子署名を含むPDFは変更しません．')
+    if missing:
+        # Never silently skip objects during the document-wide signature scan.
+        # Normalize and repeat the complete check on the repaired document.
+        raise MissingXrefError('xrefに参照できないオブジェクトがあります．')
 
 
 def _safe_image_xref(doc: fitz.Document, xref: int) -> bool:
@@ -98,7 +129,7 @@ def inspect_images(doc: fitz.Document) -> tuple[list[ImageUse], dict]:
                   unresolved_image_refs=0, document_image_xobjects=0,
                   document_fallback_images=0)
     for pn, page in enumerate(doc):
-        for info in page.get_image_info(xrefs=True):
+        for info in _image_info(page):
             counts['displayed_images'] += 1
             xref = int(info.get('xref') or 0)
             if not xref:
@@ -110,7 +141,13 @@ def inspect_images(doc: fitz.Document) -> tuple[list[ImageUse], dict]:
             uses.setdefault(xref, ImageUse(pn, xref, 0, 0))
         # Resource enumeration is independent of rendered bitmap digest matching.
         # This includes referenced images from nested Form XObjects.
-        for entry in page.get_images(full=True):
+        try:
+            entries = page.get_images(full=True)
+        except (RuntimeError, ValueError) as exc:
+            if not _is_missing_xref(exc):
+                raise
+            entries = []
+        for entry in entries:
             xref = int(entry[0])
             if xref <= 0:
                 continue
@@ -151,7 +188,7 @@ def desired_sizes(doc: fitz.Document, uses: list[ImageUse], dpi: int) -> dict[in
     requested = {use.xref for use in uses}
     dimensions = {xref: [0.0, 0.0] for xref in requested}
     for page in doc:
-        for info in page.get_image_info(xrefs=True):
+        for info in _image_info(page):
             xref = int(info.get('xref') or 0)
             if xref in dimensions:
                 bbox = fitz.Rect(info['bbox'])
@@ -173,7 +210,7 @@ def desired_sizes(doc: fitz.Document, uses: list[ImageUse], dpi: int) -> dict[in
     # associate different images with arbitrary page positions.
     unknown_w = unknown_h = 0.0
     for page in doc:
-        for info in page.get_image_info(xrefs=True):
+        for info in _image_info(page):
             if not info.get('xref'):
                 rect = fitz.Rect(info['bbox'])
                 unknown_w = max(unknown_w, abs(rect.width))
@@ -287,14 +324,26 @@ def optimize(src: Path, dst: Path) -> dict:
     repaired = False
     try:
         with fitz.open(src) as original:
-            check_pdf(original)
-            if original.is_repaired:
+            needs_normalization = bool(original.is_repaired)
+            if not needs_normalization:
+                try:
+                    check_pdf(original)
+                except MissingXrefError:
+                    needs_normalization = True
+            if needs_normalization:
+                # A missing object might conceal a signature dictionary. In this
+                # ambiguous case, do not rewrite a potentially signed original.
+                if not original.is_repaired and (b'/ByteRange' in src.read_bytes()):
+                    raise UnsafePDF('電子署名の可能性があるPDFのxrefは自動修復しません．')
                 repaired = True
                 original_fields = field_snapshot(original)
                 original_content = content_snapshot(original)
                 original_pages = original.page_count
                 original_geometry = [(tuple(p.rect), p.rotation) for p in original]
-                original.save(repaired_path, garbage=3, deflate=True)
+                try:
+                    original.save(repaired_path, garbage=3, deflate=True)
+                except (RuntimeError, ValueError) as exc:
+                    raise UnsafePDF('xrefを安全に再構築できませんでした．') from exc
                 with fitz.open(repaired_path) as normalized:
                     check_pdf(normalized)
                     if normalized.is_repaired:
@@ -317,10 +366,20 @@ def _optimize_checked(working_src: Path, dst: Path,
         _, image_stats = inspect_images(doc)
         if image_stats['inline_images']:
             from inline_images import diagnose_inline_images
-            image_stats.update(diagnose_inline_images(doc))
-            if image_stats['inline_unknown_location']:
+            try:
+                image_stats.update(diagnose_inline_images(doc))
+            except (RuntimeError, ValueError) as exc:
+                if not _is_missing_xref(exc):
+                    raise
+                image_stats['image_diagnostics_skipped'] = True
+            if image_stats.get('inline_unknown_location'):
                 from stream_diagnostics import diagnose_unlocated_images
-                image_stats.update(diagnose_unlocated_images(doc))
+                try:
+                    image_stats.update(diagnose_unlocated_images(doc))
+                except (RuntimeError, ValueError) as exc:
+                    if not _is_missing_xref(exc):
+                        raise
+                    image_stats['image_diagnostics_skipped'] = True
         n_images = image_stats['displayed_images']
         pages = doc.page_count
     # An already-small PDF is not re-encoded needlessly. Report that clearly.

@@ -614,3 +614,45 @@ def test_unrepairable_pdf_rejected_without_output(tmp_path):
     with raises((UnsafePDF, RuntimeError, ValueError)):
         optimize(src, dst)
     assert not dst.exists()
+
+
+def test_missing_xref_during_signature_scan_requests_repair(tmp_path, monkeypatch):
+    import optimizer
+    source = tmp_path / 'badref.pdf'
+    with fitz.open() as doc:
+        doc.new_page().insert_text((50, 50), 'xref test')
+        doc.save(source)
+    original = fitz.Document.xref_object
+
+    def broken_one(doc, xref, *args, **kwargs):
+        if getattr(doc, 'name', '') == str(source) and xref == 1:
+            raise RuntimeError('code=7: cannot find object in xref (1 0 R)')
+        return original(doc, xref, *args, **kwargs)
+
+    monkeypatch.setattr(fitz.Document, 'xref_object', broken_one)
+    target = tmp_path / 'out.pdf'
+    result = optimizer.optimize(source, target)
+    assert result['repaired'] is True
+    with fitz.open(target) as output:
+        assert 'xref test' in output[0].get_text()
+
+
+def test_image_info_falls_back_without_xref_guess(tmp_path, monkeypatch):
+    import optimizer
+    source = tmp_path / 'image.pdf'
+    sample_pdf(source)
+    real = fitz.Page.get_image_info
+
+    def broken_match(page, *args, **kwargs):
+        if kwargs.get('xrefs'):
+            raise RuntimeError('code=7: cannot find object in xref')
+        return real(page, *args, **kwargs)
+
+    monkeypatch.setattr(fitz.Page, 'get_image_info', broken_match)
+    with fitz.open(source) as doc:
+        records = optimizer._image_info(doc[0])
+        assert records
+        assert all(record['xref'] == 0 for record in records)
+        uses, stats = optimizer.inspect_images(doc)
+        assert uses  # independent image resources remain available
+        assert stats['unresolved_image_refs'] >= 1

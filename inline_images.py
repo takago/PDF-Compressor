@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import fitz
 from PIL import Image
 
-from optimizer import MAX_PIXELS
+from optimizer import MAX_PIXELS, _image_info, _is_missing_xref
 
 BI_RE = re.compile(rb'(?<!\S)BI(?=\s)')
 ID_RE = re.compile(rb'(?<!\S)ID(?=\s)')
@@ -179,7 +179,13 @@ def _candidate_streams(doc: fitz.Document, page: fitz.Page):
     """Visit page streams and *displayed* Form XObject streams once."""
     for xref in page.get_contents():
         yield xref, page.xref
-    for item in page.get_xobjects():
+    try:
+        forms = page.get_xobjects()
+    except (RuntimeError, ValueError) as exc:
+        if not _is_missing_xref(exc):
+            raise
+        forms = []
+    for item in forms:
         # get_xobjects includes nested and direct Form XObjects.
         xref = int(item[0])
         if xref > 0 and doc.xref_is_stream(xref):
@@ -194,7 +200,7 @@ def compress_inline_images(doc: fitz.Document, dpi: int, quality: int) -> int:
     changed = 0
     visited = set()
     for page in doc:
-        inline = [i for i in page.get_image_info(xrefs=True) if not i.get('xref')]
+        inline = [i for i in _image_info(page) if not i.get('xref')]
         if not inline:
             continue
         max_w = max((abs(fitz.Rect(i['bbox']).width) for i in inline), default=0)
@@ -205,7 +211,12 @@ def compress_inline_images(doc: fitz.Document, dpi: int, quality: int) -> int:
             if stream_xref in visited:
                 continue
             visited.add(stream_xref)
-            raw_stream = doc.xref_stream(stream_xref)
+            try:
+                raw_stream = doc.xref_stream(stream_xref)
+            except (RuntimeError, ValueError) as exc:
+                if not _is_missing_xref(exc):
+                    raise
+                continue
             if not BI_RE.search(raw_stream):
                 continue
             replacements = []
@@ -252,7 +263,12 @@ def diagnose_inline_images(doc: fitz.Document) -> dict:
             if stream_xref in visited:
                 continue
             visited.add(stream_xref)
-            stream = doc.xref_stream(stream_xref)
+            try:
+                stream = doc.xref_stream(stream_xref)
+            except (RuntimeError, ValueError) as exc:
+                if not _is_missing_xref(exc):
+                    raise
+                continue
             cursor = 0
             while (found := BI_RE.search(stream, cursor)) is not None:
                 result['inline_blocks_found'] += 1
@@ -266,6 +282,6 @@ def diagnose_inline_images(doc: fitz.Document) -> dict:
                     result['inline_blocks_parseable'] += 1
                     cursor = block.end
     found = result['inline_blocks_found']
-    displayed = sum(1 for page in doc for i in page.get_image_info(xrefs=True) if not i.get('xref'))
+    displayed = sum(1 for page in doc for i in _image_info(page) if not i.get('xref'))
     result['inline_unknown_location'] = max(0, displayed - found)
     return result
