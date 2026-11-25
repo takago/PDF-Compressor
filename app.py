@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
+import stat
 import os
 import re
 import shutil
@@ -90,6 +92,108 @@ def safe_relative_pdf_path(path: str, uploaded_name: str) -> str:
         raise HTTPException(400, 'フォルダ内のファイル名が一致しません．')
     safe_parts = [safe_path_component(x) for x in parts[:-1]]
     return '/'.join([*safe_parts, safe_filename(parts[-1], False)])
+
+
+def safe_upload_path(path: str, filename: str) -> str:
+    """Validate a folder-relative PDF or ZIP path without trusting ZIP names."""
+    if not isinstance(path, str) or not path or len(path) > 1024 or "\\" in path or path.startswith('/') or ':' in path or '\x00' in path:
+        raise HTTPException(400, 'フォルダ内のファイルパスが不正です．')
+    parts = path.split('/')
+    if (len(parts) > 32 or any(x in ('', '.', '..') or len(x) > 180 or
+            any(ord(c) < 32 or ord(c) == 127 for c in x) for x in parts)
+            or parts[-1] != filename or not filename.lower().endswith(('.pdf', '.zip'))):
+        raise HTTPException(400, 'フォルダ内のファイルパスが不正です．')
+    return '/'.join([*(safe_path_component(x) for x in parts[:-1]),
+                     safe_filename(filename, False) if filename.lower().endswith('.pdf')
+                     else safe_path_component(filename)])
+
+
+MAX_ZIP_DEPTH = 3
+MAX_EXPANDED_BYTES = 500_000_000
+MAX_ZIP_ENTRIES = 3000
+
+
+def expand_uploads(staged: list[tuple[Path, str]], target: Path) -> list[tuple[Path, str]]:
+    """Expand archives safely into private temporary files; never extract ZIP paths directly."""
+    expanded: list[tuple[Path, str]] = []
+    total_expanded = 0
+    total_entries = 0
+    temp_index = 0
+    seen: set[str] = set()
+
+    def check_member_path(name: str) -> list[str]:
+        if ('\\' in name or name.startswith('/') or ':' in name or '\x00' in name):
+            raise HTTPException(400, 'ZIP内に危険なパスがあります．')
+        parts = name.rstrip('/').split('/')
+        if (not parts or len(parts) > 32 or any(not x or x in ('.', '..') or len(x) > 180 or
+                any(ord(c) < 32 or ord(c) == 127 for c in x) for x in parts)):
+            raise HTTPException(400, 'ZIP内に危険なパスがあります．')
+        return [safe_path_component(x) for x in parts]
+
+    def visit(source: Path, relative: str, depth: int, from_zip: bool = False) -> None:
+        nonlocal total_expanded, total_entries, temp_index
+        if relative.lower().endswith('.pdf'):
+            if from_zip and relative in seen:
+                raise HTTPException(400, 'ZIP内に同じパスのPDFがあります．')
+            if len(expanded) >= MAX_BATCH_FILES:
+                raise HTTPException(413, 'ZIP展開後のPDFは300件までです．')
+            if source.stat().st_size > MAX_UPLOAD:
+                raise HTTPException(413, 'ZIP内のPDFが1ファイルの容量上限を超えています．')
+            if source.open('rb').read(5) != b'%PDF-':
+                raise HTTPException(400, 'ZIP内にPDFとして読み込めないファイルがあります．')
+            seen.add(relative)
+            expanded.append((source, relative))
+            return
+        if depth >= MAX_ZIP_DEPTH:
+            raise HTTPException(413, 'ZIPの入れ子は3階層までです．')
+        archive_base = relative[:-4]
+        try:
+            with zipfile.ZipFile(source) as archive:
+                for item in archive.infolist():
+                    total_entries += 1
+                    if total_entries > MAX_ZIP_ENTRIES:
+                        raise HTTPException(413, 'ZIP内のファイル・フォルダ数が上限を超えました．')
+                    parts = check_member_path(item.filename)
+                    mode = (item.external_attr >> 16) & 0o170000
+                    if mode not in (0, stat.S_IFREG, stat.S_IFDIR):
+                        raise HTTPException(400, 'ZIP内の特殊ファイルには対応していません．')
+                    if item.flag_bits & 1:
+                        raise HTTPException(400, '暗号化ZIPには対応していません．')
+                    if item.is_dir():
+                        continue
+                    suffix = parts[-1].lower()
+                    if not suffix.endswith(('.pdf', '.zip')):
+                        continue
+                    member_rel = '/'.join([archive_base, *parts])
+                    if len(member_rel) > 1024:
+                        raise HTTPException(400, 'ZIP内のパスが長すぎます．')
+                    if item.file_size > MAX_UPLOAD:
+                        raise HTTPException(413, 'ZIP内のファイルが200 MBを超えています．')
+                    if total_expanded + item.file_size > MAX_EXPANDED_BYTES:
+                        raise HTTPException(413, 'ZIP展開後の合計容量が500 MBを超えています．')
+                    temp_index += 1
+                    out = target / f'extracted-{temp_index}'
+                    actual = 0
+                    with archive.open(item) as inp, out.open('wb') as dest:
+                        while data := inp.read(1024 * 1024):
+                            actual += len(data)
+                            if (actual > MAX_UPLOAD or
+                                    total_expanded + actual > MAX_EXPANDED_BYTES):
+                                raise HTTPException(413, 'ZIP展開後の容量上限を超えました．')
+                            dest.write(data)
+                    total_expanded += actual
+                    visit(out, member_rel, depth + 1 if suffix.endswith('.zip') else depth, True)
+        except (zipfile.BadZipFile, EOFError, RuntimeError, OSError, NotImplementedError) as exc:
+            raise HTTPException(400, 'ZIPが破損しているか，対応できない圧縮方式です．') from exc
+
+    for source, relative in staged:
+        if relative.lower().endswith('.zip'):
+            visit(source, relative, 0)
+        else:
+            visit(source, relative, 0)
+    if not expanded:
+        raise HTTPException(400, '圧縮対象のPDFが見つかりませんでした．')
+    return expanded
 
 
 def safe_path_component(name: str) -> str:
@@ -297,8 +401,13 @@ admission_lock: asyncio.Lock | None = None
 
 @app.post('/api/batches', status_code=202)
 async def create_batch(files: list[UploadFile] = File(...), paths: str | None = Form(None)):
-    if not 1 <= len(files) <= MAX_BATCH_FILES or (len(files) == 1 and paths is None):
-        raise HTTPException(400, f'一括処理では2〜{MAX_BATCH_FILES}件，フォルダの場合は1件から指定してください．')
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(400, '一度にアップロードできるPDF・ZIPは300件までです．')
+    if not files or (len(files) == 1 and paths is None and
+                     not (files[0].filename or '').lower().endswith('.zip')):
+        raise HTTPException(400, '一括処理は複数PDF，フォルダ，またはZIPを指定してください．')
+    if any(not f.filename or not f.filename.lower().endswith(('.pdf', '.zip')) for f in files):
+        raise HTTPException(400, 'PDFとZIP以外のファイルが含まれています．')
     relative_paths = [''] * len(files)
     if paths is not None:
         try:
@@ -306,44 +415,53 @@ async def create_batch(files: list[UploadFile] = File(...), paths: str | None = 
         except (ValueError, TypeError):
             raise HTTPException(400, 'フォルダ情報が正しくありません．')
         if not isinstance(supplied, list) or len(supplied) != len(files):
-            raise HTTPException(400, 'PDFの件数とフォルダ情報が一致しません．')
-        relative_paths = [safe_relative_pdf_path(path, f.filename or '')
+            raise HTTPException(400, 'ファイルの件数とフォルダ情報が一致しません．')
+        relative_paths = [safe_upload_path(path, f.filename or '')
                           for path, f in zip(supplied, files)]
         if len(set(relative_paths)) != len(relative_paths):
-            raise HTTPException(400, '同じパスのPDFが重複しています．')
+            raise HTTPException(400, '同じパスのファイルが重複しています．')
     if queue is None or upload_slots is None or admission_lock is None:
         raise HTTPException(503, 'サービスの初期化が完了していません．')
-    if any(not f.filename or not f.filename.lower().endswith('.pdf') for f in files):
-        raise HTTPException(400, 'PDF以外のファイルが含まれています．')
     bid = uuid.uuid4().hex
     written: list[str] = []
     records: list[Job] = []
     async with admission_lock:
-        # queue.qsize() excludes running jobs; these are intentionally not counted against waiting capacity.
-        if queue.qsize() + len(files) > MAX_WAITING:
+        if queue.qsize() >= MAX_WAITING:
             raise HTTPException(503, '待機キューが混雑しています．後ほど再試行してください．')
-        total = 0
         try:
-            async with upload_slots:
-                for f in files:
+            with tempfile.TemporaryDirectory(prefix='pdf-batch-', dir=DATA_DIR) as staging_name:
+                stage = Path(staging_name)
+                staged = []
+                total = 0
+                async with upload_slots:
+                    for index, f in enumerate(files):
+                        path = stage / f'upload-{index}'
+                        size = 0
+                        with path.open('wb') as stream:
+                            while chunk := await f.read(1024 * 1024):
+                                size += len(chunk)
+                                total += len(chunk)
+                                if size > MAX_UPLOAD or total > MAX_BATCH_BYTES:
+                                    raise HTTPException(413, 'アップロード容量の上限を超えました．')
+                                await asyncio.to_thread(stream.write, chunk)
+                        if f.filename.lower().endswith('.pdf') and path.open('rb').read(5) != b'%PDF-':
+                            raise HTTPException(400, 'PDF形式ではないファイルが含まれています．')
+                        staged.append((path, relative_paths[index] or
+                                       (safe_filename(f.filename, False) if f.filename.lower().endswith('.pdf')
+                                        else safe_path_component(f.filename))))
+                extracted = await asyncio.to_thread(expand_uploads, staged, stage)
+                if queue.qsize() + len(extracted) > MAX_WAITING:
+                    raise HTTPException(503, '展開後のPDF件数が待機キューの空き容量を超えています．')
+                for source, relative in extracted:
                     ident = uuid.uuid4().hex
                     directory = DATA_DIR / ident
                     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
                     written.append(ident)
-                    size = 0
-                    with (directory / 'input.pdf').open('wb') as stream:
-                        while chunk := await f.read(1024 * 1024):
-                            size += len(chunk)
-                            total += len(chunk)
-                            if size > MAX_UPLOAD or total > MAX_BATCH_BYTES:
-                                raise HTTPException(413, 'アップロード容量の上限を超えました．')
-                            await asyncio.to_thread(stream.write, chunk)
-                    with (directory / 'input.pdf').open('rb') as check:
-                        valid_pdf = check.read(5) == b'%PDF-'
-                    if not valid_pdf:
-                        raise HTTPException(400, 'PDF形式ではないファイルが含まれています．')
-                    records.append(Job(id=ident, filename=f.filename, batch_id=bid,
-                                       relative_path=relative_paths[len(records)]))
+                    shutil.copyfile(source, directory / 'input.pdf')
+                    output_name = relative.rsplit('/', 1)[-1]
+                    records.append(Job(id=ident, filename=output_name, batch_id=bid,
+                                       relative_path=relative if (paths is not None or any(
+                                           (f.filename or '').lower().endswith('.zip') for f in files)) else ''))
             batches[bid] = Batch(id=bid, job_ids=[r.id for r in records])
             for record in records:
                 jobs[record.id] = record
@@ -358,7 +476,8 @@ async def create_batch(files: list[UploadFile] = File(...), paths: str | None = 
         finally:
             for f in files:
                 await f.close()
-    return {'id': bid, 'status_url': f'/api/batches/{bid}', 'download_url': f'/api/batches/{bid}/download'}
+    return {'id': bid, 'status_url': f'/api/batches/{bid}', 'download_url': f'/api/batches/{bid}/download',
+            'total': len(records)}
 
 
 def batch_state(batch: Batch):

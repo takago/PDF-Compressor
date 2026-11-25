@@ -732,3 +732,90 @@ def test_batch_without_folder_still_flat_zip(tmp_path, monkeypatch):
         status = wait_for_batch(client, response.json()['id'])
         with zipfile.ZipFile(BytesIO(client.get(status['download_url']).content)) as z:
             assert set(z.namelist()) == {'one_compressed.pdf', 'two_compressed.pdf'}
+
+
+def test_zip_single_and_nested_archive_preserve_hierarchy(tmp_path, monkeypatch):
+    import zipfile
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    source = tmp_path / 'tiny.pdf'
+    with fitz.open() as doc:
+        doc.new_page().insert_text((50, 50), 'PDF from ZIP')
+        doc.save(source)
+    inner = BytesIO()
+    with zipfile.ZipFile(inner, 'w') as z:
+        z.writestr('nested/sub/b.pdf', source.read_bytes())
+    outer = BytesIO()
+    with zipfile.ZipFile(outer, 'w') as z:
+        z.writestr('Class-A/a.pdf', source.read_bytes())
+        z.writestr('Class-B/inner.zip', inner.getvalue())
+        z.writestr('notes.txt', 'ignored')
+    with TestClient(app.app) as client:
+        r = client.post('/api/batches', files=[('files', ('Reports.zip', outer.getvalue(), 'application/zip'))])
+        assert r.status_code == 202, r.text
+        status = wait_for_batch(client, r.json()['id'])
+        assert status['total'] == 2 and status['completed'] == 2, status
+        result = client.get(status['download_url'])
+        with zipfile.ZipFile(BytesIO(result.content)) as archive:
+            assert sorted(archive.namelist()) == [
+                'Reports/Class-A/a.pdf',
+                'Reports/Class-B/inner/nested/sub/b.pdf',
+            ]
+
+
+def test_zip_folder_root_and_pdf_together(tmp_path, monkeypatch):
+    import zipfile
+    import json
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    source = tmp_path / 'tiny.pdf'
+    with fitz.open() as doc:
+        doc.new_page()
+        doc.save(source)
+    blob = BytesIO()
+    with zipfile.ZipFile(blob, 'w') as z:
+        z.writestr('student.pdf', source.read_bytes())
+    with TestClient(app.app) as client:
+        r = client.post('/api/batches', files=[
+            ('files', ('direct.pdf', source.read_bytes(), 'application/pdf')),
+            ('files', ('pack.zip', blob.getvalue(), 'application/zip'))],
+            data={'paths': json.dumps(['Course/direct.pdf', 'Course/pack.zip'])})
+        assert r.status_code == 202, r.text
+        status = wait_for_batch(client, r.json()['id'])
+        assert status['completed'] == 2, status
+        with zipfile.ZipFile(BytesIO(client.get(status['download_url']).content)) as archive:
+            assert sorted(archive.namelist()) == [
+                'Course/direct.pdf', 'Course/pack/student.pdf']
+
+
+def test_zip_path_traversal_and_encryption_rejected(tmp_path, monkeypatch):
+    import zipfile
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    for member in ('../danger.pdf', '/absolute.pdf', 'a/../../bad.pdf', 'a\\bad.pdf'):
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, 'w') as z:
+            z.writestr(member, b'%PDF-test')
+        with TestClient(app.app) as client:
+            r = client.post('/api/batches', files=[('files', ('bad.zip', buf.getvalue(), 'application/zip'))])
+            assert r.status_code == 400, (member, r.text)
+            assert not app.batches
+
+
+def test_zip_decompression_limit_and_depth(tmp_path, monkeypatch):
+    import zipfile
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    monkeypatch.setattr(app, 'MAX_EXPANDED_BYTES', 1000)
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr('huge.pdf', b'%PDF-' + b'A'*3000)
+    with TestClient(app.app) as client:
+        r = client.post('/api/batches', files=[('files', ('huge.zip', buf.getvalue(), 'application/zip'))])
+        assert r.status_code == 413, r.text
+    monkeypatch.setattr(app, 'MAX_EXPANDED_BYTES', 500_000_000)
+    payload = b'%PDF-test'
+    for i in range(4):
+        inner = BytesIO()
+        with zipfile.ZipFile(inner, 'w') as z:
+            z.writestr('child.pdf' if i == 0 else 'child.zip', payload)
+        payload = inner.getvalue()
+    with TestClient(app.app) as client:
+        r = client.post('/api/batches', files=[('files', ('top.zip', payload, 'application/zip'))])
+        assert r.status_code == 413, r.text
