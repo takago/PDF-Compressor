@@ -315,6 +315,18 @@ def verify(src: Path, dst: Path) -> None:
             raise UnsafePDF('文字またはリンクの維持を確認できないため処理を中止しました．')
 
 
+
+
+
+def make_font_candidate(src: Path, dst: Path) -> None:
+    """Re-subset used glyphs without changing the source PDF."""
+    with fitz.open(src) as doc:
+        check_pdf(doc)
+        doc.subset_fonts()
+        doc.save(str(dst), garbage=4, deflate=True, deflate_fonts=True)
+    verify(src, dst)
+
+
 def optimize(src: Path, dst: Path) -> dict:
     input_size = src.stat().st_size
     # A repaired PDF must be normalized before any image operations. Never edit
@@ -382,76 +394,92 @@ def _optimize_checked(working_src: Path, dst: Path,
                     image_stats['image_diagnostics_skipped'] = True
         n_images = image_stats['displayed_images']
         pages = doc.page_count
-    # An already-small PDF is not re-encoded needlessly. Report that clearly.
-    working_size = working_src.stat().st_size
-    if working_size <= TARGET_BYTES:
-        dst.write_bytes(working_src.read_bytes())
-        return dict(input_bytes=input_size, output_bytes=working_size, pages=pages,
-                    image_count=n_images, compressed_images=0, achieved=True,
-                    note=('自動修復したPDFが1 MB以内のため，画像は変更していません．' if repaired else '元のPDFがすでに1 MB以内のため，画像は変更していません．'), dpi=None,
-                    reason='already_under_target', compressed_inline_images=0, repaired=repaired, **image_stats)
-    best_size = working_size
-    best_path = None
+
+    font_candidate = dst.with_name('font_candidate.pdf')
+    image_candidate = dst.with_name('candidate.pdf')
+    best_size = working_src.stat().st_size
+    best_data = None
     best_count = 0
     best_dpi = None
     best_inline_count = 0
-    candidate = dst.with_name('candidate.pdf')
+    font_optimized = False
+    font_bytes_saved = 0
+    font_warning = None
+    image_src = working_src
+
     try:
+        # Always attempt font optimization, even if the original is under
+        # 1MB: these PDFs are intended as final, submitted documents.
+        try:
+            make_font_candidate(working_src, font_candidate)
+            new_size = font_candidate.stat().st_size
+            if new_size < best_size:
+                font_optimized = True
+                font_bytes_saved = best_size - new_size
+                best_size = new_size
+                best_data = font_candidate.read_bytes()
+                image_src = font_candidate
+        except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+            # Keep the original and continue with image optimization. A
+            # failed/unsafe font rewrite must never be returned.
+            font_warning = str(exc)[:200]
+
+        # Always attempt JPEG optimization too. Each preset starts from the
+        # same structurally verified font baseline, avoiding cumulative quality loss.
         for dpi, quality in PRESETS:
-            count, _, inline_count = make_candidate(working_src, candidate, dpi, quality)
-            size = candidate.stat().st_size
+            count, _, inline_count = make_candidate(image_src, image_candidate, dpi, quality)
+            size = image_candidate.stat().st_size
             if size < best_size:
-                verify(working_src, candidate)
-                best_path = candidate.read_bytes()
+                verify(working_src, image_candidate)
+                best_data = image_candidate.read_bytes()
                 best_size, best_count, best_dpi = size, count, dpi
                 best_inline_count = inline_count
+            # Stop once target reached AND a JPEG pass was attempted.
             if size <= TARGET_BYTES:
                 break
-        if best_path is None:
+
+        if best_data is None:
             dst.write_bytes(working_src.read_bytes())
         else:
-            dst.write_bytes(best_path)
+            dst.write_bytes(best_data)
     finally:
-        candidate.unlink(missing_ok=True)
+        font_candidate.unlink(missing_ok=True)
+        image_candidate.unlink(missing_ok=True)
+
     output_size = dst.stat().st_size
-    if best_count == 0:
-        if n_images == 0:
-            note = 'ページ内に表示された画像を検出できませんでした．ベクター図形や注釈の外観である可能性があります．'
-            reason = 'no_displayed_images'
-        elif image_stats['eligible_images'] == 0:
-            if image_stats.get('inline_images'):
-                found = image_stats.get('inline_blocks_found', 0)
-                parseable = image_stats.get('inline_blocks_parseable', 0)
-                in_forms = image_stats.get('inline_in_forms', 0)
-                if not found:
-                    note = (f"表示画像{image_stats['inline_images']}件の参照元を特定できませんでした．"
-                            '画像XObjectとの対応付けもできていません．'
-                            'JPEG品質やdpiを変更しても解決しません．')
-                else:
-                    note = (f"インライン画像{image_stats['inline_images']}件を検出しましたが，圧縮できませんでした．"
-                            f"描画命令内で発見{found}件（対応形式{parseable}件，フォーム内部{in_forms}件）．"
-                            '未対応の形式または圧縮後にサイズが減らなかった可能性があります．')
-            else:
-                note = (f"画像は{n_images}件ありますが，今回対応できる画像は0件でした．"
-                        f"マスク等{image_stats['masked_images']}件．")
-            reason = 'unsupported_image_structure'
-        else:
-            note = ('画像XObjectは検出されましたが，JPEG再圧縮でファイルサイズが減りませんでした．'
-                    '画像が既に圧縮済みの可能性があります．')
-            reason = 'no_image_replaced'
+    if best_data is None and working_src.stat().st_size <= TARGET_BYTES:
+        reason = 'already_under_target'
+        note = '元のPDFがすでに1 MB以内で，追加の削減はありませんでした．'
+    elif best_count == 0 and not font_optimized and n_images == 0:
+        reason = 'no_displayed_images'
+        note = '表示画像がなく，フォント最適化でも削減できませんでした．'
+    elif best_count == 0 and not font_optimized and image_stats['eligible_images'] == 0:
+        reason = 'unsupported_image_structure'
+        note = '画像の構造を安全に変換できませんでした．'
     elif output_size <= TARGET_BYTES:
-        note = f'{best_count}個の画像を圧縮し，1 MB以内になりました．'
         reason = 'achieved'
-    else:
-        note = f'{best_count}個の画像を圧縮しましたが，画像だけでは1 MB以内にできませんでした．'
+        note = '1 MB以内になりました．'
+    elif output_size < input_size:
         reason = 'above_target'
+        note = '軽量化しましたが，1 MB以内にはできませんでした．'
+    else:
+        reason = 'no_reduction'
+        note = '安全にファイルサイズを削減できませんでした．'
+    if font_optimized:
+        note = f'フォントを最適化しました（{font_bytes_saved} bytes削減）．' + note
+    if best_count:
+        note = f'画像{best_count}件を再圧縮しました．' + note
+    if font_warning:
+        note += ' フォント最適化は検証に失敗したため採用していません．'
     if repaired:
         note = 'PDFの構造を自動修復しました．' + note
     return dict(input_bytes=input_size, output_bytes=output_size,
                 pages=pages, image_count=n_images, compressed_images=best_count,
                 achieved=output_size <= TARGET_BYTES,
                 note=note, dpi=best_dpi, reason=reason,
-                compressed_inline_images=best_inline_count, repaired=repaired, **image_stats)
+                compressed_inline_images=best_inline_count, repaired=repaired,
+                font_optimized=font_optimized, font_bytes_saved=font_bytes_saved,
+                font_warning=font_warning, **image_stats)
 
 
 def main():

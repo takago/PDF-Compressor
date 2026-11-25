@@ -819,3 +819,21 @@ def test_zip_decompression_limit_and_depth(tmp_path, monkeypatch):
     with TestClient(app.app) as client:
         r = client.post('/api/batches', files=[('files', ('top.zip', payload, 'application/zip'))])
         assert r.status_code == 413, r.text
+
+
+def test_font_subsetting_without_page_render_comparison(tmp_path, monkeypatch):
+    """Font stage must preserve structured content without rasterizing pages."""
+    from optimizer import make_font_candidate, verify
+    src = tmp_path / 'font_input.pdf'
+    dst = tmp_path / 'font_output.pdf'
+    with fitz.open() as doc:
+        p = doc.new_page()
+        p.insert_text((30, 30), 'Text stays searchable')
+        doc.save(src)
+
+    def no_raster(*args, **kwargs):
+        raise AssertionError('Page raster comparison must not be called')
+    monkeypatch.setattr(fitz.Page, 'get_pixmap', no_raster)
+    make_font_candidate(src, dst)
+    verify(src, dst)
+    assert dst.exists()
