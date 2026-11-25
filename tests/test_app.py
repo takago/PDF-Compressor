@@ -550,3 +550,10 @@ def test_batch_and_queue_limits_for_large_class(tmp_path, monkeypatch):
         response = client.post('/api/batches', files=many)
         assert response.status_code == 400
         assert '300' in str(response.json())
+
+
+def test_default_max_upload_200mb():
+    assert app.MAX_UPLOAD == 200_000_000
+    html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+    assert "f.size>200000000" in html
+    assert "1ファイルあたり200 MB" in html

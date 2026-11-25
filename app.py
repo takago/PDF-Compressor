@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get('PDF_OPT_TMP', '/tmp/pdf-compressor')).resolve()
-MAX_UPLOAD = int(os.environ.get('PDF_OPT_MAX_MB', '100')) * 1_000_000
+MAX_UPLOAD = int(os.environ.get('PDF_OPT_MAX_MB', '200')) * 1_000_000
 TTL = 300
 PROCESS_TIMEOUT = 120
 MAX_RUNNING = 2
