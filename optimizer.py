@@ -50,8 +50,6 @@ def content_snapshot(doc: fitz.Document) -> list:
 def check_pdf(doc: fitz.Document) -> None:
     if doc.needs_pass:
         raise UnsafePDF('パスワードで保護されたPDFには対応していません．')
-    if doc.is_repaired:
-        raise UnsafePDF('破損修復が必要なPDFは安全のため処理しません．')
     catalog = doc.pdf_catalog()
     kind, val = doc.xref_get_key(catalog, 'AcroForm')
     if kind == 'xref':
@@ -282,7 +280,39 @@ def verify(src: Path, dst: Path) -> None:
 
 def optimize(src: Path, dst: Path) -> dict:
     input_size = src.stat().st_size
-    with fitz.open(src) as doc:
+    # A repaired PDF must be normalized before any image operations. Never edit
+    # the user's input; save the repaired structure as a temporary working PDF.
+    repaired_path = dst.with_name('repaired_input.pdf')
+    working_src = src
+    repaired = False
+    try:
+        with fitz.open(src) as original:
+            check_pdf(original)
+            if original.is_repaired:
+                repaired = True
+                original_fields = field_snapshot(original)
+                original_content = content_snapshot(original)
+                original_pages = original.page_count
+                original_geometry = [(tuple(p.rect), p.rotation) for p in original]
+                original.save(repaired_path, garbage=3, deflate=True)
+                with fitz.open(repaired_path) as normalized:
+                    check_pdf(normalized)
+                    if normalized.is_repaired:
+                        raise UnsafePDF('PDFの自動修復後も構造エラーが残っています．')
+                    if (normalized.page_count != original_pages or
+                        field_snapshot(normalized) != original_fields or
+                        content_snapshot(normalized) != original_content or
+                        [(tuple(p.rect), p.rotation) for p in normalized] != original_geometry):
+                        raise UnsafePDF('PDFの自動修復で文字・フォーム・リンク・ページ構成の維持を確認できませんでした．')
+                working_src = repaired_path
+        return _optimize_checked(working_src, dst, input_size, repaired)
+    finally:
+        repaired_path.unlink(missing_ok=True)
+
+
+def _optimize_checked(working_src: Path, dst: Path,
+                      input_size: int, repaired: bool) -> dict:
+    with fitz.open(working_src) as doc:
         check_pdf(doc)
         _, image_stats = inspect_images(doc)
         if image_stats['inline_images']:
@@ -294,13 +324,14 @@ def optimize(src: Path, dst: Path) -> dict:
         n_images = image_stats['displayed_images']
         pages = doc.page_count
     # An already-small PDF is not re-encoded needlessly. Report that clearly.
-    if input_size <= TARGET_BYTES:
-        dst.write_bytes(src.read_bytes())
-        return dict(input_bytes=input_size, output_bytes=input_size, pages=pages,
+    working_size = working_src.stat().st_size
+    if working_size <= TARGET_BYTES:
+        dst.write_bytes(working_src.read_bytes())
+        return dict(input_bytes=input_size, output_bytes=working_size, pages=pages,
                     image_count=n_images, compressed_images=0, achieved=True,
-                    note='元のPDFがすでに1 MB以内のため，画像は変更していません．', dpi=None,
-                    reason='already_under_target', compressed_inline_images=0, **image_stats)
-    best_size = input_size
+                    note=('自動修復したPDFが1 MB以内のため，画像は変更していません．' if repaired else '元のPDFがすでに1 MB以内のため，画像は変更していません．'), dpi=None,
+                    reason='already_under_target', compressed_inline_images=0, repaired=repaired, **image_stats)
+    best_size = working_size
     best_path = None
     best_count = 0
     best_dpi = None
@@ -308,17 +339,17 @@ def optimize(src: Path, dst: Path) -> dict:
     candidate = dst.with_name('candidate.pdf')
     try:
         for dpi, quality in PRESETS:
-            count, _, inline_count = make_candidate(src, candidate, dpi, quality)
+            count, _, inline_count = make_candidate(working_src, candidate, dpi, quality)
             size = candidate.stat().st_size
             if size < best_size:
-                verify(src, candidate)
+                verify(working_src, candidate)
                 best_path = candidate.read_bytes()
                 best_size, best_count, best_dpi = size, count, dpi
                 best_inline_count = inline_count
             if size <= TARGET_BYTES:
                 break
         if best_path is None:
-            dst.write_bytes(src.read_bytes())
+            dst.write_bytes(working_src.read_bytes())
         else:
             dst.write_bytes(best_path)
     finally:
@@ -355,11 +386,13 @@ def optimize(src: Path, dst: Path) -> dict:
     else:
         note = f'{best_count}個の画像を圧縮しましたが，画像だけでは1 MB以内にできませんでした．'
         reason = 'above_target'
+    if repaired:
+        note = 'PDFの構造を自動修復しました．' + note
     return dict(input_bytes=input_size, output_bytes=output_size,
                 pages=pages, image_count=n_images, compressed_images=best_count,
                 achieved=output_size <= TARGET_BYTES,
                 note=note, dpi=best_dpi, reason=reason,
-                compressed_inline_images=best_inline_count, **image_stats)
+                compressed_inline_images=best_inline_count, repaired=repaired, **image_stats)
 
 
 def main():

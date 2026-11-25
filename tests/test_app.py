@@ -557,3 +557,60 @@ def test_default_max_upload_200mb():
     html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
     assert "f.size>200000000" in html
     assert "1ファイルあたり200 MB" in html
+
+
+def damaged_xref_pdf(source: Path, broken: Path):
+    """Corrupt only the xref locator, not the document's page contents."""
+    data = source.read_bytes()
+    pos = data.rfind(b'startxref')
+    assert pos >= 0
+    import re
+    data = data[:pos] + re.sub(rb'(?<=startxref\n)\d+', b'999999999', data[pos:], count=1)
+    broken.write_bytes(data)
+    with fitz.open(broken) as doc:
+        assert doc.is_repaired
+
+
+def test_auto_repairs_malformed_xref_preserving_form_text_links(tmp_path):
+    source = tmp_path / 'original.pdf'
+    broken = tmp_path / 'broken.pdf'
+    result_pdf = tmp_path / 'repaired-output.pdf'
+    sample_pdf(source)
+    damaged_xref_pdf(source, broken)
+    result = optimize(broken, result_pdf)
+    assert result['repaired'] is True
+    assert result_pdf.exists()
+    assert not (tmp_path / 'repaired_input.pdf').exists()
+    with fitz.open(broken) as before, fitz.open(result_pdf) as after:
+        assert after.is_repaired is False
+        assert before.page_count == after.page_count
+        assert field_snapshot(before) == field_snapshot(after)
+        assert before[0].get_text('text') == after[0].get_text('text')
+        assert before[0].get_links()[0]['uri'] == after[0].get_links()[0]['uri']
+
+
+def test_auto_repair_even_if_original_below_1mb(tmp_path):
+    source = tmp_path / 'small.pdf'
+    broken = tmp_path / 'broken.pdf'
+    output = tmp_path / 'out.pdf'
+    with fitz.open() as doc:
+        doc.new_page().insert_text((50, 60), 'Small PDF with broken xref')
+        doc.save(source)
+    damaged_xref_pdf(source, broken)
+    result = optimize(broken, output)
+    assert result['repaired'] is True
+    assert result['reason'] == 'already_under_target'
+    with fitz.open(output) as doc:
+        assert not doc.is_repaired
+        assert 'Small PDF' in doc[0].get_text()
+
+
+def test_unrepairable_pdf_rejected_without_output(tmp_path):
+    from pytest import raises
+    from optimizer import UnsafePDF
+    src = tmp_path / 'invalid.pdf'
+    dst = tmp_path / 'out.pdf'
+    src.write_bytes(b'%PDF-1.7\nnot a valid PDF')
+    with raises((UnsafePDF, RuntimeError, ValueError)):
+        optimize(src, dst)
+    assert not dst.exists()
