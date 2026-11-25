@@ -656,3 +656,79 @@ def test_image_info_falls_back_without_xref_guess(tmp_path, monkeypatch):
         uses, stats = optimizer.inspect_images(doc)
         assert uses  # independent image resources remain available
         assert stats['unresolved_image_refs'] >= 1
+
+
+def test_folder_upload_preserves_nested_paths(tmp_path, monkeypatch):
+    import json
+    import zipfile
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    first = tmp_path / 'one.pdf'
+    second = tmp_path / 'two.pdf'
+    sample_pdf(first)
+    sample_pdf(second)
+    with TestClient(app.app) as client:
+        accepted = client.post('/api/batches',
+            files=[('files', ('one.pdf', first.read_bytes(), 'application/pdf')),
+                   ('files', ('two.pdf', second.read_bytes(), 'application/pdf'))],
+            data={'paths': json.dumps(['Reports/Class-A/one.pdf', 'Reports/Class-B/two.pdf'])})
+        assert accepted.status_code == 202, accepted.text
+        status = wait_for_batch(client, accepted.json()['id'])
+        assert status['status'] == 'done'
+        assert all(f['status'] == 'done' for f in status['files']), status
+        assert {f['name'] for f in status['files']} == {
+            'Reports/Class-A/one.pdf', 'Reports/Class-B/two.pdf'}
+        download = client.get(status['download_url'])
+        assert download.status_code == 200
+        with zipfile.ZipFile(BytesIO(download.content)) as z:
+            assert set(z.namelist()) == {
+                'Reports/Class-A/one_compressed.pdf',
+                'Reports/Class-B/two_compressed.pdf'}
+            assert all(z.read(name).startswith(b'%PDF-') for name in z.namelist())
+
+
+def test_folder_one_pdf_returns_zip(tmp_path, monkeypatch):
+    import json
+    import zipfile
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    source = tmp_path / 'only.pdf'
+    sample_pdf(source)
+    with TestClient(app.app) as client:
+        response = client.post('/api/batches',
+            files=[('files', ('only.pdf', source.read_bytes(), 'application/pdf'))],
+            data={'paths': json.dumps(['Project/sub/only.pdf'])})
+        assert response.status_code == 202, response.text
+        status = wait_for_batch(client, response.json()['id'])
+        assert status['status'] == 'done', status
+        with zipfile.ZipFile(BytesIO(client.get(status['download_url']).content)) as z:
+            assert z.namelist() == ['Project/sub/only_compressed.pdf']
+
+
+def test_folder_paths_reject_unsafe_names(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    source = tmp_path / 'safe.pdf'
+    sample_pdf(source)
+    for path in ('../safe.pdf', '/tmp/safe.pdf', 'a/../../safe.pdf',
+                 'a\\safe.pdf', 'a//safe.pdf', 'a/other.pdf',
+                 'C:/safe.pdf', 'a/./safe.pdf'):
+        with TestClient(app.app) as client:
+            response = client.post('/api/batches',
+                files=[('files', ('safe.pdf', source.read_bytes(), 'application/pdf'))],
+                data={'paths': json.dumps([path])})
+            assert response.status_code == 400, (path, response.text)
+            assert not app.batches
+
+
+def test_batch_without_folder_still_flat_zip(tmp_path, monkeypatch):
+    import zipfile
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    source = tmp_path / 'sample.pdf'
+    sample_pdf(source)
+    with TestClient(app.app) as client:
+        response = client.post('/api/batches', files=[
+            ('files', ('one.pdf', source.read_bytes(), 'application/pdf')),
+            ('files', ('two.pdf', source.read_bytes(), 'application/pdf'))])
+        assert response.status_code == 202
+        status = wait_for_batch(client, response.json()['id'])
+        with zipfile.ZipFile(BytesIO(client.get(status['download_url']).content)) as z:
+            assert set(z.namelist()) == {'one_compressed.pdf', 'two_compressed.pdf'}

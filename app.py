@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -43,6 +43,7 @@ class Job:
     result: dict = field(default_factory=dict)
     error: str = ''
     batch_id: str = ''
+    relative_path: str = ''
 
 
 @dataclass
@@ -68,6 +69,39 @@ def safe_filename(original: str, compressed: bool = True) -> str:
     stem = ''.join(c for c in stem if c.isprintable() and c not in '/\\\x00\r\n\t' and ord(c) != 127).strip(' .')[:120]
     stem = stem or 'document'
     return stem + ('_compressed' if compressed else '') + '.pdf'
+
+
+def safe_relative_pdf_path(path: str, uploaded_name: str) -> str:
+    """Validate client-supplied folder path; return a safe ZIP member path.
+
+    Reject traversal and ambiguous path forms rather than silently normalizing them.
+    The path must terminate in the uploaded PDF's filename.
+    """
+    if not isinstance(path, str) or not path or len(path) > 1024:
+        raise HTTPException(400, 'フォルダ内のファイルパスが不正です．')
+    if "\\" in path or path.startswith('/') or ':' in path or '\x00' in path:
+        raise HTTPException(400, 'フォルダ内のファイルパスが不正です．')
+    parts = path.split('/')
+    if len(parts) > 32 or any(part in ('', '.', '..') or len(part) > 180 or
+                            any(ord(c) < 32 or ord(c) == 127 for c in part)
+                            for part in parts):
+        raise HTTPException(400, 'フォルダ内のファイルパスが不正です．')
+    if parts[-1] != uploaded_name or not parts[-1].lower().endswith('.pdf'):
+        raise HTTPException(400, 'フォルダ内のファイル名が一致しません．')
+    safe_parts = [safe_path_component(x) for x in parts[:-1]]
+    return '/'.join([*safe_parts, safe_filename(parts[-1], False)])
+
+
+def safe_path_component(name: str) -> str:
+    return name.strip(' .')[:180] or 'folder'
+
+
+def archive_filename(record: Job) -> str:
+    """Preserve folder structure while using the actual output basename."""
+    if record.relative_path:
+        parent = record.relative_path.rpartition('/')[0]
+        return (parent + '/' if parent else '') + record.filename
+    return record.filename
 
 
 def purge_expired():
@@ -262,9 +296,21 @@ admission_lock: asyncio.Lock | None = None
 
 
 @app.post('/api/batches', status_code=202)
-async def create_batch(files: list[UploadFile] = File(...)):
-    if not 2 <= len(files) <= MAX_BATCH_FILES:
-        raise HTTPException(400, f'一度に2〜{MAX_BATCH_FILES}件のPDFを指定してください．')
+async def create_batch(files: list[UploadFile] = File(...), paths: str | None = Form(None)):
+    if not 1 <= len(files) <= MAX_BATCH_FILES or (len(files) == 1 and paths is None):
+        raise HTTPException(400, f'一括処理では2〜{MAX_BATCH_FILES}件，フォルダの場合は1件から指定してください．')
+    relative_paths = [''] * len(files)
+    if paths is not None:
+        try:
+            supplied = json.loads(paths)
+        except (ValueError, TypeError):
+            raise HTTPException(400, 'フォルダ情報が正しくありません．')
+        if not isinstance(supplied, list) or len(supplied) != len(files):
+            raise HTTPException(400, 'PDFの件数とフォルダ情報が一致しません．')
+        relative_paths = [safe_relative_pdf_path(path, f.filename or '')
+                          for path, f in zip(supplied, files)]
+        if len(set(relative_paths)) != len(relative_paths):
+            raise HTTPException(400, '同じパスのPDFが重複しています．')
     if queue is None or upload_slots is None or admission_lock is None:
         raise HTTPException(503, 'サービスの初期化が完了していません．')
     if any(not f.filename or not f.filename.lower().endswith('.pdf') for f in files):
@@ -296,7 +342,8 @@ async def create_batch(files: list[UploadFile] = File(...)):
                         valid_pdf = check.read(5) == b'%PDF-'
                     if not valid_pdf:
                         raise HTTPException(400, 'PDF形式ではないファイルが含まれています．')
-                    records.append(Job(id=ident, filename=f.filename, batch_id=bid))
+                    records.append(Job(id=ident, filename=f.filename, batch_id=bid,
+                                       relative_path=relative_paths[len(records)]))
             batches[bid] = Batch(id=bid, job_ids=[r.id for r in records])
             for record in records:
                 jobs[record.id] = record
@@ -344,10 +391,10 @@ async def batch_status(bid: str):
     response = {'id': bid, 'status': 'done' if finished else 'running',
                 'total': len(records), 'queued': counts['queued'], 'running': counts['running'],
                 'completed': counts['done'], 'failed': counts['failed'],
-                'files': [{'name': safe_filename(r.filename, False), 'status': r.state,
+                'files': [{'name': r.relative_path or safe_filename(r.filename, False), 'status': r.state,
                            **({'input_bytes': r.result.get('input_bytes', 0),
                                'output_bytes': r.result.get('output_bytes', 0),
-                               'filename': r.filename} if r.state == 'done' else {}),
+                               'filename': archive_filename(r)} if r.state == 'done' else {}),
                            **({'error': r.error} if r.state == 'failed' else {})}
                           for r in records]}
     if finished:
@@ -381,7 +428,7 @@ async def batch_download(bid: str):
                     src = DATA_DIR / record.id / 'output.pdf'
                     if not src.is_file():
                         raise HTTPException(410, '圧縮済みPDFがありません．')
-                    filename = safe_filename(record.filename, False)
+                    filename = archive_filename(record)
                     stem = filename[:-4]
                     suffix = 2
                     while filename in used_names:

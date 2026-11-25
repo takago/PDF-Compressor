@@ -27,10 +27,10 @@
   <main>
     <h1>PDF Compressor</h1>
     <div class="muted">画像だけを圧縮して，1 MB以内を目指します．文字とフォーム入力は維持します．</div>
-    <div id="drop" tabindex="0" role="button" aria-label="PDFをドロップまたは選択">
+    <div id="drop" tabindex="0" role="button" aria-label="PDFやフォルダをドロップまたはPDFを選択">
       <div class="symbol">⇩</div>
-      <strong>ここにPDFをドロップ</strong>
-      <span class="muted">複数PDFもまとめて処理できます．クリックして選択することもできます．</span>
+      <strong>ここにPDFまたはフォルダをドロップ</strong>
+      <span class="muted">フォルダ内の階層を維持して圧縮します．クリックするとPDFを選択できます．</span>
     </div>
     <input id="file" type="file" accept="application/pdf,.pdf" multiple hidden>
     <div id="status" class="hide" role="status" aria-live="polite"><span class="spinner"></span>アップロードしています…</div>
@@ -93,10 +93,39 @@
     $('headline').textContent=headline;
     $('headline').className=after<before?'good':'warn';
   }
+  // Read every entry of a dropped directory. readEntries() returns batches,
+  // so one call is not enough for directories containing >100 files.
+  async function entriesFromDrop(transfer){
+    const items=Array.from(transfer.items||[]);
+    const roots=items.map(item=>item.webkitGetAsEntry?.()).filter(Boolean);
+    if(!roots.length)return {files:Array.from(transfer.files||[]).map(file=>({file,path:file.name})),folder:false};
+    const collected=[];
+    let folder=false;
+    async function visit(entry,parts){
+      if(entry.isFile){
+        if(!/\.pdf$/i.test(entry.name))return;
+        const file=await new Promise((resolve,reject)=>entry.file(resolve,reject));
+        collected.push({file,path:[...parts,entry.name].join('/')});
+        if(collected.length>300)throw new Error('一度にアップロードできるPDFは300件までです．');
+      }else if(entry.isDirectory){
+        folder=true;
+        const reader=entry.createReader();
+        while(true){
+          const batch=await new Promise((resolve,reject)=>reader.readEntries(resolve,reject));
+          if(!batch.length)break;
+          for(const child of batch)await visit(child,[...parts,entry.name]);
+        }
+      }
+    }
+    for(const root of roots)await visit(root,[]);
+    return {files:collected,folder};
+  }
   async function upload(input){
     if(busy)return;
-    const files=Array.from(input||[]);
-    if(!files.length)return;
+    const folder=!!input.folder;
+    const entries=input.files||[];
+    const files=entries.map(entry=>entry.file);
+    if(!files.length){if(folder)showError('フォルダ内にPDFがありません．');return;}
     if(files.some(f=>!/\.pdf$/i.test(f.name))){showError('PDFファイルだけを選択してください．');return}
     if(files.some(f=>f.size>200000000)){showError('1ファイルあたり200 MBまでです．');return}
     if(files.length>300){showError('一度にアップロードできるPDFは300件までです．');return}
@@ -105,8 +134,9 @@
     drop.setAttribute('aria-disabled','true');setStatus(files.length+'件のPDFをアップロードしています…');
     try{
       const body=new FormData();
-      for(const f of files)body.append(files.length===1?'file':'files',f,f.name);
-      const isBatch=files.length>1;
+      const isBatch=folder||files.length>1;
+      for(const f of files)body.append(isBatch?'files':'file',f,f.name);
+      if(folder)body.append('paths',JSON.stringify(entries.map(entry=>entry.path)));
       const accepted=await request(isBatch?'/api/batches':'/api/compress',{method:'POST',body});
       const data=await waitFor(accepted.status_url,update=>{
         if(isBatch){
@@ -156,12 +186,17 @@
   }
   for(const ev of ['dragenter','dragover'])drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')});
   for(const ev of ['dragleave','drop'])drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over')});
-  drop.addEventListener('drop',e=>upload(e.dataTransfer.files));
+  async function handleDrop(transfer){
+    if(busy)return;
+    try{const selected=await entriesFromDrop(transfer);await upload(selected)}
+    catch(e){showError(e.message||'フォルダを読み取れませんでした．')}
+  }
+  drop.addEventListener('drop',e=>handleDrop(e.dataTransfer));
   document.addEventListener('dragover',e=>e.preventDefault());
-  document.addEventListener('drop',e=>{e.preventDefault();if(!drop.contains(e.target))upload(e.dataTransfer.files)});
+  document.addEventListener('drop',e=>{e.preventDefault();if(!drop.contains(e.target))handleDrop(e.dataTransfer)});
   drop.addEventListener('click',()=>{if(!busy)picker.click()});
   drop.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();if(!busy)picker.click()}});
-  picker.addEventListener('change',()=>upload(picker.files));
+  picker.addEventListener('change',()=>upload({files:Array.from(picker.files).map(file=>({file,path:file.name})),folder:false}));
 })();
 </script>
 </body></html>
