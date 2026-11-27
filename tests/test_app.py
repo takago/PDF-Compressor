@@ -552,11 +552,11 @@ def test_batch_and_queue_limits_for_large_class(tmp_path, monkeypatch):
         assert '300' in str(response.json())
 
 
-def test_default_max_upload_200mb():
-    assert app.MAX_UPLOAD == 200_000_000
+def test_default_max_upload_512mb():
+    assert app.MAX_UPLOAD == 512_000_000
     html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
-    assert "f.size>200000000" in html
-    assert "1ファイルあたり200 MB" in html
+    assert "f.size>512000000" in html
+    assert "1ファイルあたり512 MB" in html
 
 
 def damaged_xref_pdf(source: Path, broken: Path):
@@ -837,3 +837,44 @@ def test_font_subsetting_without_page_render_comparison(tmp_path, monkeypatch):
     make_font_candidate(src, dst)
     verify(src, dst)
     assert dst.exists()
+
+
+def test_single_keep_original_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    pdf = tmp_path / 'sample.pdf'
+    sample_pdf(pdf)
+    with TestClient(app.app) as client:
+        response = client.post('/api/compress',
+            data={'keep_original_name': 'true'},
+            files={'file': ('sample.pdf', pdf.read_bytes(), 'application/pdf')})
+        assert response.status_code == 202, response.text
+        accepted = response.json()
+        for _ in range(150):
+            info = client.get(accepted['status_url']).json()
+            if info['status'] in ('done', 'failed'):
+                break
+            time.sleep(.05)
+        assert info['status'] == 'done', info
+        assert info['filename'] == 'sample.pdf'
+        downloaded = client.get(info['download_url'])
+        assert downloaded.status_code == 200
+        assert 'sample.pdf' in downloaded.headers['content-disposition']
+
+def test_batch_keep_original_names_and_folders(tmp_path, monkeypatch):
+    import json as _json
+    import zipfile as _zipfile
+    monkeypatch.setattr(app, 'DATA_DIR', tmp_path / 'jobs')
+    pdf = tmp_path / 'sample.pdf'
+    sample_pdf(pdf)
+    with TestClient(app.app) as client:
+        response = client.post('/api/batches',
+            data={'keep_original_name': 'true', 'paths': _json.dumps(['Class-A/a.pdf', 'Class-B/b.pdf'])},
+            files=[('files', ('a.pdf', pdf.read_bytes(), 'application/pdf')),
+                   ('files', ('b.pdf', pdf.read_bytes(), 'application/pdf'))])
+        assert response.status_code == 202, response.text
+        info = wait_for_batch(client, response.json()['id'])
+        assert info['status'] == 'done', info
+        z = client.get(info['download_url'])
+        assert z.status_code == 200
+        with _zipfile.ZipFile(BytesIO(z.content)) as archive:
+            assert set(archive.namelist()) == {'Class-A/a.pdf', 'Class-B/b.pdf'}

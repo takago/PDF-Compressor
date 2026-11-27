@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get('PDF_OPT_TMP', '/tmp/pdf-compressor')).resolve()
-MAX_UPLOAD = int(os.environ.get('PDF_OPT_MAX_MB', '200')) * 1_000_000
+MAX_UPLOAD = int(os.environ.get('PDF_OPT_MAX_MB', '512')) * 1_000_000
 TTL = 300
 PROCESS_TIMEOUT = 120
 MAX_RUNNING = 2
@@ -46,6 +46,7 @@ class Job:
     error: str = ''
     batch_id: str = ''
     relative_path: str = ''
+    keep_original_name: bool = False
 
 
 @dataclass
@@ -109,7 +110,7 @@ def safe_upload_path(path: str, filename: str) -> str:
 
 
 MAX_ZIP_DEPTH = 3
-MAX_EXPANDED_BYTES = 500_000_000
+MAX_EXPANDED_BYTES = 1_000_000_000
 MAX_ZIP_ENTRIES = 3000
 
 
@@ -168,9 +169,9 @@ def expand_uploads(staged: list[tuple[Path, str]], target: Path) -> list[tuple[P
                     if len(member_rel) > 1024:
                         raise HTTPException(400, 'ZIP内のパスが長すぎます．')
                     if item.file_size > MAX_UPLOAD:
-                        raise HTTPException(413, 'ZIP内のファイルが200 MBを超えています．')
+                        raise HTTPException(413, f'ZIP内のファイルが{MAX_UPLOAD // 1_000_000} MBを超えています．')
                     if total_expanded + item.file_size > MAX_EXPANDED_BYTES:
-                        raise HTTPException(413, 'ZIP展開後の合計容量が500 MBを超えています．')
+                        raise HTTPException(413, 'ZIP展開後の合計容量が1 GBを超えています．')
                     temp_index += 1
                     out = target / f'extracted-{temp_index}'
                     actual = 0
@@ -283,7 +284,10 @@ async def process_one(record: Job):
     finished = time.time()
     record.expires = finished + TTL
     (directory / 'expires.txt').write_text(str(record.expires), encoding='ascii')
-    record.filename = safe_filename(record.filename, result.get('output_bytes', 0) < result.get('input_bytes', 0))
+    record.filename = safe_filename(
+        record.filename,
+        result.get('output_bytes', 0) < result.get('input_bytes', 0) and not record.keep_original_name,
+    )
     record.result = {k: v for k, v in result.items() if k != 'ok'}
     record.state = 'done'
 
@@ -351,7 +355,7 @@ async def index():
 
 
 @app.post('/api/compress', status_code=202)
-async def compress(file: UploadFile = File(...)):
+async def compress(file: UploadFile = File(...), keep_original_name: bool = Form(False)):
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, 'PDFファイルを指定してください．')
     if queue is None or upload_slots is None:
@@ -376,7 +380,7 @@ async def compress(file: UploadFile = File(...)):
             with (directory / 'input.pdf').open('rb') as handle:
                 if handle.read(5) != b'%PDF-':
                     raise HTTPException(400, 'PDF形式ではありません．')
-        record = Job(id=ident, filename=file.filename)
+        record = Job(id=ident, filename=file.filename, keep_original_name=keep_original_name)
         jobs[ident] = record
         try:
             queue.put_nowait(ident)
@@ -395,12 +399,13 @@ async def compress(file: UploadFile = File(...)):
 # Upload a batch as one request, registering all jobs together.
 # Cap a single batch at 300 files while preserving room for other users in the 600-job queue.
 MAX_BATCH_FILES = 300
-MAX_BATCH_BYTES = 500_000_000
+MAX_BATCH_BYTES = 1_000_000_000
 admission_lock: asyncio.Lock | None = None
 
 
 @app.post('/api/batches', status_code=202)
-async def create_batch(files: list[UploadFile] = File(...), paths: str | None = Form(None)):
+async def create_batch(files: list[UploadFile] = File(...), paths: str | None = Form(None),
+                       keep_original_name: bool = Form(False)):
     if len(files) > MAX_BATCH_FILES:
         raise HTTPException(400, '一度にアップロードできるPDF・ZIPは300件までです．')
     if not files or (len(files) == 1 and paths is None and
@@ -460,6 +465,7 @@ async def create_batch(files: list[UploadFile] = File(...), paths: str | None = 
                     shutil.copyfile(source, directory / 'input.pdf')
                     output_name = relative.rsplit('/', 1)[-1]
                     records.append(Job(id=ident, filename=output_name, batch_id=bid,
+                                       keep_original_name=keep_original_name,
                                        relative_path=relative if (paths is not None or any(
                                            (f.filename or '').lower().endswith('.zip') for f in files)) else ''))
             batches[bid] = Batch(id=bid, job_ids=[r.id for r in records])

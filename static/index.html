@@ -11,7 +11,7 @@
     h1{font-size:1.65rem;margin:0 0 8px;letter-spacing:-.025em} .muted{color:#66758a;font-size:.92rem}
     #drop{border:2px dashed #a4b5cf;border-radius:15px;background:#f8fbff;text-align:center;padding:60px 20px;margin:26px 0 16px;transition:.15s;cursor:pointer}
     #drop.over{border-color:#2774dd;background:#eaf3ff;transform:scale(1.01)}
-    #drop strong{display:block;font-size:1.16rem;margin:8px 0} .symbol{font-size:2.4rem;color:#4c80c1}
+    #options{margin:4px 0 16px;font-size:.94rem;color:#34445d} #options label{display:inline-flex;gap:9px;align-items:center;cursor:pointer} #options input{width:17px;height:17px;accent-color:#2774dd} #drop strong{display:block;font-size:1.16rem;margin:8px 0} .symbol{font-size:2.4rem;color:#4c80c1}
     .hide{display:none!important} #result{border-radius:14px;background:#f5f9ff;padding:22px;margin-top:20px}
     .numbers{display:flex;justify-content:space-between;gap:15px;margin:18px 0}
     .numbers>div{flex:1}.numbers small{display:block;color:#66758a}.numbers b{font-size:1.65rem}
@@ -32,6 +32,7 @@
       <strong>ここにPDF・ZIP・フォルダをドロップ</strong>
       <span class="muted">ZIP内やフォルダ内の階層を維持して圧縮します．クリックでPDF・ZIPを選択できます．</span>
     </div>
+    <div id="options"><label for="keepOriginalName"><input id="keepOriginalName" type="checkbox">元のファイル名で出力する（_compressedを付けない）</label></div>
     <input id="file" type="file" accept="application/pdf,application/zip,.pdf,.zip" multiple hidden>
     <div id="status" class="hide" role="status" aria-live="polite"><span class="spinner"></span>アップロードしています…</div>
     <div id="error" class="hide" role="alert"></div>
@@ -127,9 +128,9 @@
     const files=entries.map(entry=>entry.file);
     if(!files.length){if(folder)showError('フォルダ内にPDF・ZIPがありません．');return;}
     if(files.some(f=>!/\.(pdf|zip)$/i.test(f.name))){showError('PDFまたはZIPだけを選択してください．');return}
-    if(files.some(f=>f.size>200000000)){showError('1ファイルあたり200 MBまでです．');return}
+    if(files.some(f=>f.size>512000000)){showError('1ファイルあたり512 MBまでです．');return}
     if(files.length>300){showError('一度にアップロードできるPDFは300件までです．');return}
-    if(files.length>1 && files.reduce((sum,f)=>sum+f.size,0)>500000000){showError('一度のアップロード合計は500 MBまでです．');return}
+    if(files.length>1 && files.reduce((sum,f)=>sum+f.size,0)>1000000000){showError('一度のアップロード合計は1 GBまでです．');return}
     busy=true;err.classList.add('hide');result.classList.add('hide');$('batchProgress').classList.add('hide');
     drop.setAttribute('aria-disabled','true');setStatus(files.length+'件のファイルをアップロードしています…');
     try{
@@ -137,6 +138,7 @@
       const isBatch=folder||files.length>1||/\.zip$/i.test(files[0].name);
       for(const f of files)body.append(isBatch?'files':'file',f,f.name);
       if(folder)body.append('paths',JSON.stringify(entries.map(entry=>entry.path)));
+      body.append('keep_original_name', $('keepOriginalName').checked ? 'true' : 'false');
       const accepted=await request(isBatch?'/api/batches':'/api/compress',{method:'POST',body});
       const data=await waitFor(accepted.status_url,update=>{
         if(isBatch){
